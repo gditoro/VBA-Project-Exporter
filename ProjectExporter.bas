@@ -249,12 +249,12 @@ Public Function ExportVbaProject(ProjectPath As String, SourceWorkbook As Workbo
 End Function
 
 '*******************************************************************************
-' Sub: TestExporter
+' Sub: RunExporter
 ' Purpose: Test function to export the VBA project of the active workbook
 ' The path will be the same as the active workbook with the VBA components exported to a subdirectory
 ' named after the workbook.
 '*******************************************************************************
-Public Sub TestExporter()
+Public Sub RunExporter()
     Dim ExportPath As String
     Dim success As Boolean
     
