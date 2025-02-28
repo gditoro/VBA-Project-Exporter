@@ -1,172 +1,283 @@
 Option Explicit
-
 '*******************************************************************************
 ' Module: ProjectExporter
-' Purpose: Exports all VBA components from the specified workbook to a directory.
-'          Supports automatic sub-folder creation and custom filtering for components.
+' Purpose: Exports all VBA components from the active workbook to a specified
+'          directory.
+' Author:  Giovanni Di Toro
+' Date:    28-Feb-2025
+' Version: 1.1
 '*******************************************************************************
+
+'*******************************************************************************
+' Function: GetExportFolder
+' Purpose: Prompts the user to confirm or select an export folder
+' Inputs:
+'   DefaultPath: The default export path to suggest
+' Outputs:
+'   String: The confirmed or selected export folder path, or empty string if canceled
+'*******************************************************************************
+Private Function GetExportFolder(DefaultPath As String) As String
+    Dim folderPath As String
+    Dim userChoice As VbMsgBoxResult
+    Dim fDialog As Object
+    
+    ' Extract directory from the default path
+    folderPath = Left(DefaultPath, InStrRev(DefaultPath, Application.PathSeparator))
+    
+    ' Suggest the default export location
+    userChoice = MsgBox("Export to:" & vbCrLf & folderPath & vbCrLf & vbCrLf & _
+                        "Click Yes to confirm this location" & vbCrLf & _
+                        "Click No to choose another location" & vbCrLf & _
+                        "Click Cancel to abort export", _
+                        vbQuestion + vbYesNoCancel, "Confirm Export Location")
+    
+    Select Case userChoice
+        Case vbYes
+            ' User confirmed the default location
+            GetExportFolder = folderPath
+            
+        Case vbNo
+            ' User wants to choose another location
+            On Error Resume Next
+            ' FIX: Use proper error handling for folder dialog
+            Set fDialog = Application.FileDialog(msoFileDialogFolderPicker)
+            If Not fDialog Is Nothing Then
+                With fDialog
+                    .Title = "Select Export Folder"
+                    .AllowMultiSelect = False
+                    .InitialFileName = folderPath
+                    
+                    If .Show Then
+                        ' Fix the crash issue by checking if .SelectedItems exists and has items
+                        If .SelectedItems.Count > 0 Then
+                            folderPath = .SelectedItems(1)
+                            ' Ensure path ends with path separator
+                            If Right(folderPath, 1) <> Application.PathSeparator Then
+                                folderPath = folderPath & Application.PathSeparator
+                            End If
+                            GetExportFolder = folderPath
+                        Else
+                            GetExportFolder = ""
+                        End If
+                    Else
+                        ' User cancelled folder dialog
+                        GetExportFolder = ""
+                    End If
+                End With
+            Else
+                ' Fallback to default if dialog fails
+                MsgBox "Could not open folder selection dialog. Using default folder.", vbExclamation
+                GetExportFolder = folderPath
+            End If
+            On Error GoTo 0
+            
+        Case vbCancel
+            ' User cancelled the export
+            GetExportFolder = ""
+            
+        Case Else
+            ' Handle unexpected result
+            GetExportFolder = ""
+    End Select
+End Function
+
+'*******************************************************************************
+' Function: CreateDirectoryIfNotExists
+' Purpose: Creates a directory if it doesn't exist
+' Inputs:
+'   DirPath: Directory path to create
+' Returns:
+'   Boolean: True if directory exists or was created successfully
+'*******************************************************************************
+Private Function CreateDirectoryIfNotExists(DirPath As String) As Boolean
+    Dim fso As Object
+    
+    On Error Resume Next
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    If Not fso.FolderExists(DirPath) Then
+        fso.CreateFolder DirPath
+    End If
+    
+    CreateDirectoryIfNotExists = (Err.Number = 0)
+    On Error GoTo 0
+    
+    Set fso = Nothing
+End Function
+
+'*******************************************************************************
+' Function: SanitizeFileName
+' Purpose: Removes invalid characters from file names
+' Inputs:
+'   FileName: String containing the file name to sanitize
+' Returns:
+'   String: Sanitized file name
+'*******************************************************************************
+Private Function SanitizeFileName(FileName As String) As String
+    Dim result As String
+    Dim invalidChars As String
+    Dim i As Integer
+    
+    ' Define invalid filename characters
+    invalidChars = "\/:*?""<>|"
+    
+    result = FileName
+    
+    ' Replace invalid characters with underscore
+    For i = 1 To Len(invalidChars)
+        result = Replace(result, Mid(invalidChars, i, 1), "_")
+    Next i
+    
+    SanitizeFileName = result
+End Function
 
 '*******************************************************************************
 ' Function: ExportVbaProject
 ' Purpose: Exports all VBA components from the specified workbook to a directory.
 ' Inputs:
-'   ProjectPath (String): The path to the directory where the VBA components will be
-'                         exported.
-'   SourceWorkbook (Workbook): The workbook from which the VBA components will be exported.
-'   Overwrite (Boolean): Optional boolean to specify if existing files should be
-'                        overwritten (default = False).
-'   filters (Dictionary): Optional filters to categorize files into folders based on patterns.
+'   ProjectPath: The path to the directory where the VBA components will be
+'                exported.
+'   SourceWorkbook: The workbook from which the VBA components will be exported.
+'   Overwrite: Optional boolean to specify if existing files should be
+'              overwritten (default = False).
 ' Outputs:
-'   None
+'   Boolean: True if export was successful, False otherwise
 '*******************************************************************************
-Private Function ExportVbaProject(ProjectPath As String, SourceWorkbook As Workbook, Optional Overwrite As Boolean = False, Optional filters As Dictionary = Nothing) As Boolean
-    On Error GoTo HandleGeneralError
-
+Public Function ExportVbaProject(ProjectPath As String, SourceWorkbook As Workbook, Optional Overwrite As Boolean = False) As Boolean
     Dim objVbComp As VBComponent
     Dim exportDir As String
-    Dim exportPath As String
-    Dim folderName As String
+    Dim filename As String
+    Dim WbDir As String
+    Dim ExportPath As String
+    Dim selectedFolder As String
+    Dim exportCount As Long
+    Dim skipCount As Long
+    Dim totalCount As Long
     
-    ' Remove any trailing path separator from ProjectPath if present
-    If Right(ProjectPath, 1) = Application.PathSeparator Then
-        ProjectPath = Left(ProjectPath, Len(ProjectPath) - 1)
-    End If
+    ' Initialize counters
+    exportCount = 0
+    skipCount = 0
     
-    ' Construct the export directory using the workbook name
-    exportDir = ProjectPath & Application.PathSeparator & Left(SourceWorkbook.name, InStrRev(SourceWorkbook.name, ".") - 1) & " VBA Project" & Application.PathSeparator
-    
-    ' Create the directory if it doesn't exist
-    If Dir(exportDir, vbDirectory) = "" Then
-        MkDir exportDir
+    ' Get the base filename from the provided path using native VBA
+    filename = Dir(ProjectPath, vbNormal)
+
+    ' Remove extension from the filename
+    If InStr(filename, ".") > 0 Then
+        filename = Left(filename, InStrRev(filename, ".") - 1)
     End If
 
+    ' Get the directory of the workbook
+    WbDir = Left(SourceWorkbook.FullName, InStrRev(SourceWorkbook.FullName, Application.PathSeparator))
+
+    ' Get export folder confirmation from user
+    selectedFolder = GetExportFolder(WbDir)
+    
+    ' Check if user cancelled the export
+    If selectedFolder = "" Then
+        MsgBox "Export cancelled by user.", vbInformation
+        ExportVbaProject = False
+        Exit Function
+    End If
+    
+    ' Construct the export directory path
+    exportDir = selectedFolder & SanitizeFileName(filename) & " VBA Project" & Application.PathSeparator
+
+    ' Create the directory if it doesn't exist
+    If Not CreateDirectoryIfNotExists(exportDir) Then
+        MsgBox "Error creating directory: " & exportDir, vbCritical
+        ExportVbaProject = False
+        Exit Function
+    End If
+    
+    ' Count total components
+    totalCount = SourceWorkbook.VBProject.VBComponents.Count
+    
+    ' Update status bar
+    Application.StatusBar = "Exporting VBA project components..."
+    
     ' Loop through all VBA components in the specified workbook
     For Each objVbComp In SourceWorkbook.VBProject.VBComponents
-        
-        ' Determine the folder name based on the component type or custom filters
-        folderName = GetFolderNameForComponent(objVbComp, filters)
-        exportPath = exportDir & folderName & Application.PathSeparator
-        
-        ' Create the sub-folder if it doesn't exist
-        If Dir(exportPath, vbDirectory) = "" Then
-            MkDir exportPath
-        End If
-        
-        ' Ensure the component name is valid for a file path
-        exportPath = exportPath & SanitizeFilename(objVbComp.name)
-        
+        ExportPath = exportDir & SanitizeFileName(objVbComp.Name)
+
         ' Determine the type of component and set the appropriate extension
         Select Case objVbComp.Type
             Case vbext_ct_StdModule
-                exportPath = exportPath & ".bas"
-            Case vbext_ct_Document, vbext_ct_ClassModule
-                exportPath = exportPath & ".cls"
+                ExportPath = ExportPath & ".bas"
+            Case vbext_ct_ClassModule
+                ExportPath = ExportPath & ".cls"
             Case vbext_ct_MSForm
-                exportPath = exportPath & ".frm"
+                ExportPath = ExportPath & ".frm"
+            Case vbext_ct_Document
+                ExportPath = ExportPath & ".cls"
             Case Else
-                ' For unknown types, log and continue
-                exportPath = exportPath & ".txt"
-                Debug.Print "Unknown component type for: " & objVbComp.name
+                ' For unknown types, use .txt as default
+                ExportPath = ExportPath & ".txt"
         End Select
 
-        ' Check if the file exists and either overwrite or skip based on the Overwrite parameter
-        If Dir(exportPath) = "" Or Overwrite Then
-            On Error GoTo HandleExportError
-            objVbComp.Export exportPath
+        ' Update status bar with current component
+        Application.StatusBar = "Exporting: " & objVbComp.Name & " (" & (exportCount + 1) & " of " & totalCount & ")"
+
+        ' Check if file exists and either overwrite or skip based on the Overwrite parameter
+        If Dir(ExportPath) = "" Or Overwrite Then
+            On Error Resume Next
+            objVbComp.Export ExportPath
+            
+            If Err.Number = 0 Then
+                exportCount = exportCount + 1
+            Else
+                Debug.Print "Error exporting component: " & objVbComp.Name & " - " & Err.Description
+            End If
             On Error GoTo 0
         Else
-            Debug.Print "File " & exportPath & " already exists and was skipped."
+            ' Log or notify that the file was skipped
+            skipCount = skipCount + 1
+            Debug.Print "File " & ExportPath & " already exists and was skipped."
         End If
     Next objVbComp
+
+    ' Clear status bar
+    Application.StatusBar = False
+    
+    ' Show export summary
+    MsgBox "Export Summary:" & vbCrLf & _
+           "Components Exported: " & exportCount & vbCrLf & _
+           "Components Skipped: " & skipCount & vbCrLf & vbCrLf & _
+           "Export Location: " & exportDir, _
+           vbInformation, "Export Complete"
     
     ExportVbaProject = True
-    Exit Function
-
-HandleGeneralError:
-    MsgBox "An error occurred: " & Err.Description, vbCritical
-    ExportVbaProject = False
-    Exit Function
-
-HandleExportError:
-    MsgBox "Error exporting component: " & objVbComp.name & vbCrLf & "Error: " & Err.Description, vbCritical
-    Resume Next
 End Function
 
 '*******************************************************************************
-' Function: GetFolderNameForComponent
-' Purpose: Determines the folder name for a VBA component based on its type or custom filters.
-' Inputs:
-'   objVbComp (VBComponent): The VBA component.
-'   filters (Dictionary): Optional filters to categorize components into folders.
-' Outputs:
-'   String: The folder name where the component should be stored.
+' Sub: TestExporter
+' Purpose: Test function to export the VBA project of the active workbook
+' The path will be the same as the active workbook with the VBA components exported to a subdirectory
+' named after the workbook.
 '*******************************************************************************
-Private Function GetFolderNameForComponent(objVbComp As VBComponent, filters As Dictionary) As String
-    Dim pattern As Variant
-    Dim folderName As String
+Public Sub TestExporter()
+    Dim ExportPath As String
+    Dim success As Boolean
     
-    ' Check custom filters first
-    If Not filters Is Nothing Then
-        For Each pattern In filters.Keys
-            ' Filters is a dictionary with a pattern as key and folder name as value
-            If objVbComp.name Like pattern Then
-                GetFolderNameForComponent = filters(pattern)
-                Exit Function
-            End If
-        Next pattern
+    ' Check if workbook is saved
+    If Len(ThisWorkbook.Path) = 0 Then
+        MsgBox "Please save the workbook before exporting the VBA project.", vbExclamation
+        Exit Sub
     End If
     
-    ' Default folder names based on component type
-    Select Case objVbComp.Type
-        Case vbext_ct_ClassModule
-            folderName = "Class"
-        Case vbext_ct_MSForm
-            folderName = "Forms"
-        Case vbext_ct_Document
-            folderName = "Local"
-        Case vbext_ct_StdModule
-            folderName = "Modules"
-        Case Else
-            folderName = "Other"
-    End Select
+    ' This workbook path with the filename
+    ExportPath = ThisWorkbook.FullName
     
-    GetFolderNameForComponent = folderName
-End Function
+    ' Export the VBA project of this workbook to the specified path
+    success = ExportVbaProject(ExportPath, ThisWorkbook, True)
+    
+    ' Success message is shown in ExportVbaProject function
+End Sub
 
 '*******************************************************************************
-' Function: SanitizeFilename
-' Purpose: Ensures that a filename is valid by removing invalid characters.
-' Inputs:
-'   str (String): The original string to be sanitized for use as a filename.
-' Outputs:
-'   String: The sanitized string with invalid filename characters removed.
+' Sub: ExportSelectedComponents
+' Purpose: Exports only the selected components from the VBA Project
 '*******************************************************************************
-Private Function SanitizeFilename(str As String) As String
-    Dim invalidChars As String
-    Dim i As Integer
-    invalidChars = "/\:*?""<>|"
-    For i = 1 To Len(invalidChars)
-        str = Replace(str, Mid(invalidChars, i, 1), "_")
-    Next i
-    SanitizeFilename = str
-End Function
-
-'*******************************************************************************
-' Test function to export the VBA project of the active workbook
-' This is a simple example to demonstrate the usage of the ExportVbaProject function.
-' It adds custom filters to group components based on name patterns.
-'*******************************************************************************
-Private Sub ExportThisWorkbook()
-    Dim filters As Scripting.Dictionary
-    Set filters = CreateObject("Scripting.Dictionary")
-    
-    ' Example: Adding custom filters for specific components
-    filters.Add "*Helpers", "Helpers"
-    filters.Add "Globals*", "Globals"
-    
-    If Not ExportVbaProject(ThisWorkbook.Path, ThisWorkbook, True, filters) Then
-        MsgBox "Export failed.", vbCritical
-    Else
-        MsgBox "Export successful.", vbInformation
-    End If
+Public Sub ExportSelectedComponents()
+    ' Not implemented yet - future enhancement
+    MsgBox "This feature is not implemented yet.", vbInformation
 End Sub
